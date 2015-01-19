@@ -25,6 +25,8 @@
 #import "RKLog.h"
 #import "RKManagedObjectCaching.h"
 #import "RKObjectMappingMatcher.h"
+#import "RKObjectManager.h"
+#import "RKResponseDescriptor.h"
 #import "RKErrors.h"
 #import "RKObjectUtilities.h"
 
@@ -163,8 +165,70 @@ static NSDictionary *RKConnectionAttributeValuesWithObject(RKConnectionDescripti
         if ([connection.relationship isToMany]) {
             connectionResult = managedObjects;
         } else {
-            if ([managedObjects count] > 1) RKLogWarning(@"Retrieved %ld objects satisfying connection criteria for one-to-one relationship connection: only one object will be connected.", (long) [managedObjects count]);
-            if ([managedObjects count]) connectionResult = [managedObjects anyObject];
+            NSArray *managedObjectArray = managedObjects.allObjects;
+            
+            if (managedObjectArray.count > 1) {
+                RKLogWarning(@"Retrieved %ld objects satisfying connection criteria for one-to-one relationship connection: only one object will be connected to %@.", (long) [managedObjects count], connection.relationship.name);
+                
+                // We're keeping the first match, and removing the duplicates
+                NSManagedObject *firstMatch = managedObjectArray[0];
+                RKEntityMapping *mapping = nil;
+                
+                // Retrieve entity mapping
+                for (RKResponseDescriptor *descriptor in [RKObjectManager sharedManager].responseDescriptors) {
+                    if ([firstMatch isKindOfClass:((RKEntityMapping*)descriptor.mapping).objectClass]) {
+                        // This is the mapping we're looking for
+                        mapping = (RKEntityMapping*)descriptor.mapping;
+                        break;
+                    }
+                }
+                
+                if (mapping && mapping.identificationAttributes.count) {
+                    // We found a valid mapping
+                    NSString *inverseKey = connection.relationship.inverseRelationship.name;
+                    
+                    // Maintain array of inversely related entities to move from duplicates to the first match
+                    NSMutableArray *objectsToKeep = [[firstMatch valueForKey:inverseKey] mutableCopy];
+                    bool contained;
+                    
+                    // Iterate over duplicates (ignore first match), collect related entities, and delete
+                    for (int i = 1; i < managedObjectArray.count; ++i) {
+                        // Iterate over related entities for duplicates
+                        for (NSManagedObject *entityToMap in [managedObjectArray[i] valueForKey:inverseKey]) {
+                            contained = false;
+                            
+                            // Iterated over saved entities to map
+                            for (NSManagedObject *mappedEntity in objectsToKeep) {
+                                contained = true;
+                                
+                                // For each entity to map, check if it exists in entities to save
+                                for (NSAttributeDescription *identifier in mapping.identificationAttributes) {
+                                    if ([mappedEntity valueForKey:identifier.name] != [entityToMap valueForKey:identifier.name]) {
+                                        // Mark it unique
+                                        contained = false;
+                                    }
+                                }
+                            }
+                            
+                            // Add unique entity to array of entities to save
+                            if (!contained) {
+                                [objectsToKeep addObject:entityToMap];
+                            }
+                        }
+                        
+                        // Remove dupe
+                        [self.managedObjectContext deleteObject:managedObjectArray[i]];
+                    }
+                    
+                    // Set collected entities to saved connected entity
+                    [firstMatch setValue:objectsToKeep forKey:inverseKey];
+                }
+            }
+            
+            if (managedObjectArray.count) {
+                // Return connected entity
+                connectionResult = managedObjectArray[0];
+            }
         }
     } else if ([connection isKeyPathConnection]) {
         connectionResult = [self.managedObject valueForKeyPath:connection.keyPath];
